@@ -1890,157 +1890,309 @@ Automated screening reports contain:
 
 ```mermaid
 graph TD
-    CUT[Component Under Test] --> BIC[Burn-In Chamber]
-    BIC --> DAQ[DAQ System]
-    DAQ --> TGW[Telemetry Gateway / MQTT]
-    TGW --> ING[Ingestion Service]
-    ING --> VAL[Validation Service]
-    VAL --> |VALID| PRE[Preprocessing Service]
-    VAL --> |INVALID| QUA[Quarantine Store]
-    PRE --> FEA[Feature Service]
-    FEA --> HSR[Hard Safety Rule Engine]
-    FEA --> MOD_A[Module A: Anomaly Detection]
-    FEA --> MOD_B[Module B: Drift Prediction]
-    FEA --> COR[Correlation Analyzer]
-    HSR --> RFE[Risk Fusion Engine]
-    MOD_A --> RFE
-    MOD_B --> RFE
-    COR --> RFE
-    RFE --> EXP[Explainability Engine]
-    EXP --> DEC[Decision Engine]
-    DEC --> |NORMAL| PASS[PASS / NORMAL]
-    DEC --> |REVIEW| REV[REVIEW]
-    DEC --> |HIGH-RISK| HRR[HIGH-RISK REVIEW]
-    DEC --> |FAIL| FAIL[FAIL]
-    DEC --> ALS[Alert Service]
-    ALS --> DASH[Engineering Dashboard]
-    DEC --> AUD[Audit Trail]
-    DEC --> RPT[Report Generation]
+    subgraph PHYSICAL[Physical Test Environment]
+        CUT[Component Under Test]
+        BIC[Burn-In Chamber]
+        DAQ[DAQ System]
+        TC[Test Controller]
+        CUT --> BIC --> DAQ --> TC
+    end
+    subgraph INGESTION[Data Ingestion Layer]
+        ING[Ingestion API]
+        VAL[Schema Validation]
+        DQE[Data Quality Engine]
+        QUA[Quarantine Store]
+        ING --> VAL --> DQE
+        DQE -->|INVALID| QUA
+    end
+    subgraph PROCESSING[Data Processing Layer]
+        PRE[Preprocessing]
+        FEA[Feature Engineering]
+        PRE --> FEA
+    end
+    subgraph AI[Hybrid AI Screening Engine]
+        HSR[Hard Safety Rule Engine]
+        MODA[Module A: Anomaly Detection]
+        MODB[Module B: Drift Prediction]
+        COR[Correlation Analyzer]
+        RFE[Risk Fusion Engine]
+        EXP[Explainability Engine]
+        DEC[Decision Engine]
+        HSR --> RFE
+        MODA --> RFE
+        MODB --> RFE
+        COR --> RFE
+        RFE --> EXP --> DEC
+    end
+    subgraph OUTPUT[Output Layer]
+        PASS[NORMAL / PASS]
+        REV[REVIEW]
+        HRR[HIGH-RISK REVIEW]
+        FAIL[FAIL]
+        DASH[Engineering Dashboard]
+        AUD[Audit Trail]
+        RPT[Report Generation]
+    end
+    TC -->|MQTT/JSON| ING
+    DQE -->|VALID| PRE
+    FEA --> HSR
+    FEA --> MODA
+    FEA --> MODB
+    FEA --> COR
+    DEC -->|NORMAL| PASS
+    DEC -->|REVIEW| REV
+    DEC -->|HIGH-RISK| HRR
+    DEC -->|FAIL| FAIL
+    DEC --> DASH
+    DEC --> AUD
+    DEC --> RPT
 ```
 
 ### Diagram 2: Physical Test Environment
 
 ```mermaid
-graph LR
-    subgraph Physical Hardware
-        CUT1[CUT-001] & CUT2[CUT-002] & CUTN[CUT-N] --> BIB[Burn-In Board]
-        BIB --> BIC[Burn-In Chamber]
-        BIC --> TSENS[Temperature Sensors]
-        BIC --> VSRC[Voltage Source]
-        TSENS & VSRC --> DAQ[DAQ System]
-        DAQ --> TC[Test Controller]
+graph TD
+    subgraph CUTS[Components Under Test]
+        C1[CUT-001]
+        C2[CUT-002]
+        CN[CUT-N]
     end
-    subgraph Software
-        TC --> |MQTT/JSON| ING[Ingestion API]
+    subgraph CHAMBER[Burn-In Chamber]
+        BIB[Burn-In Board]
+        TSENS[Temperature Sensors]
+        VSRC[Voltage Source]
+        ESENS[Environmental Sensors]
     end
+    subgraph DAQ_LAYER[DAQ & Control]
+        DAQ[DAQ System]
+        TC[Test Controller]
+        NI[Network Interface]
+    end
+    subgraph SW[Software Ingestion]
+        ING[Ingestion API]
+    end
+    C1 & C2 & CN --> BIB
+    BIB --> TSENS
+    BIB --> VSRC
+    TSENS --> DAQ
+    VSRC --> DAQ
+    ESENS --> DAQ
+    DAQ --> TC --> NI
+    NI -->|MQTT / JSON| ING
 ```
 
-### Diagram 3: Data Flow
+### Diagram 3: End-to-End Data Flow (Sequence)
 
 ```mermaid
 sequenceDiagram
-    participant DAQ
-    participant MQTT
-    participant Ingestion
-    participant Validation
-    participant Features
-    participant AnomalyDet
-    participant DriftPred
-    participant RiskFusion
-    participant Decision
-    participant Dashboard
+    participant DAQ as DAQ System
+    participant MQTT as MQTT Broker
+    participant ING as Ingestion Service
+    participant VAL as Validation Service
+    participant FEA as Feature Service
+    participant MODA as Anomaly Detector
+    participant MODB as Drift Predictor
+    participant RF as Risk Fusion
+    participant DEC as Decision Engine
+    participant DASH as Dashboard
+    participant AUD as Audit Log
 
     DAQ->>MQTT: publish telemetry record
-    MQTT->>Ingestion: deliver record
-    Ingestion->>Validation: validate schema + quality
-    Validation-->>Ingestion: VALID / QUARANTINE
-    Ingestion->>Features: compute feature vector
-    Features->>AnomalyDet: feature matrix
-    Features->>DriftPred: early values + features
-    AnomalyDet-->>RiskFusion: anomaly_score
-    DriftPred-->>RiskFusion: drift_risk_score
-    RiskFusion->>Decision: risk_score + hard_safety_status
-    Decision->>Dashboard: decision + explanation (WebSocket)
-    Decision->>AuditLog: immutable audit entry
+    MQTT->>ING: deliver record
+    ING->>VAL: validate schema + quality
+    VAL-->>ING: VALID or QUARANTINE
+    ING->>FEA: compute feature vector
+    FEA->>MODA: feature matrix
+    FEA->>MODB: early values + features
+    MODA-->>RF: anomaly_score
+    MODB-->>RF: drift_risk_score
+    RF->>DEC: risk_score + hard_safety_status
+    DEC->>DASH: decision + explanation via WebSocket
+    DEC->>AUD: immutable audit entry
 ```
 
 ### Diagram 4: AI/ML Pipeline
 
 ```mermaid
 graph TD
-    FV[Feature Vector] --> L1A[Layer 1A: Robust Z-score / MAD]
-    FV --> L1B[Layer 1B: Isolation Forest]
-    FV --> L1C[Layer 1C: Mahalanobis Distance]
-    L1A & L1B & L1C --> AS[Anomaly Score Aggregation]
-    AS --> SHAP_A[SHAP Explainer - Module A]
-
-    FV --> DP[XGBoost Drift Predictor]
-    DP --> PI[Prediction Intervals - Quantile Regression]
-    PI --> SHAP_B[SHAP Explainer - Module B]
-
-    SHAP_A & SHAP_B --> EXP[Explainability Engine]
-    AS --> RF[Risk Fusion]
-    PI --> RF
-    EXP --> RF
-    RF --> DEC[Decision Engine]
+    subgraph INPUTS[Input Features]
+        FV[Feature Vector per Component per Checkpoint]
+    end
+    subgraph MODA[Module A - Dynamic Anomaly Detection]
+        L1A[Layer 1: Robust Z-score and MAD]
+        L1B[Layer 2: Isolation Forest]
+        L1C[Layer 3: Mahalanobis Distance]
+        AS[Anomaly Score Aggregation]
+        L1A --> AS
+        L1B --> AS
+        L1C --> AS
+    end
+    subgraph MODB[Module B - Drift Prediction]
+        DP[XGBoost Drift Predictor]
+        PI[Quantile Regression - Prediction Intervals]
+        DP --> PI
+    end
+    subgraph EXPLAIN[Explainability]
+        SHAP_A[SHAP - Module A]
+        SHAP_B[SHAP - Module B]
+    end
+    subgraph FUSION[Risk Fusion and Decision]
+        RF[Risk Fusion Engine]
+        DEC[Decision Engine]
+        RF --> DEC
+    end
+    FV --> L1A & L1B & L1C
+    FV --> DP
+    AS --> SHAP_A --> RF
+    PI --> SHAP_B --> RF
 ```
 
 ### Diagram 5: Hybrid Decision Engine
 
 ```mermaid
 flowchart TD
-    START([Input: Component Measurement]) --> HSR{Hard Safety\nLimit Violated?}
-    HSR --> |YES| FAIL([FAIL - Deterministic\nAI cannot override])
-    HSR --> |NO| AI_OK{AI Services\nAvailable?}
-    AI_OK --> |NO| MRR([MANUAL_REVIEW_REQUIRED\nConservative Fallback])
-    AI_OK --> |YES| DQ{Data Quality\nSufficient?}
-    DQ --> |NO| MRR
-    DQ --> |YES| RS{Risk Score\n>= 0.85?}
-    RS --> |YES| HRR([HIGH-RISK REVIEW])
-    RS --> |NO| DR{Drift Risk\n>= 0.70?}
-    DR --> |YES| EI([EARLY INVESTIGATION])
-    DR --> |NO| MS{Risk Score\n>= 0.40?}
-    MS --> |YES| REV([REVIEW])
-    MS --> |NO| NRM([NORMAL])
+    START([Input: Component Measurement]) --> HSR{Hard Safety Limit Violated?}
+    HSR -->|YES| FAIL([FAIL - Deterministic - AI cannot override])
+    HSR -->|NO| AI_OK{AI Services Available?}
+    AI_OK -->|NO| MRR([MANUAL REVIEW REQUIRED - Conservative Fallback])
+    AI_OK -->|YES| DQ{Data Quality Sufficient?}
+    DQ -->|NO| MRR
+    DQ -->|YES| RS{Risk Score >= 0.85?}
+    RS -->|YES| HRR([HIGH-RISK REVIEW])
+    RS -->|NO| DR{Drift Risk >= 0.70?}
+    DR -->|YES| EI([EARLY INVESTIGATION])
+    DR -->|NO| MS{Risk Score >= 0.40?}
+    MS -->|YES| REV([REVIEW])
+    MS -->|NO| NRM([NORMAL])
 ```
 
-### Diagram 6: Risk Fusion Engine
-
-```mermaid
-graph LR
-    HSS[Hard Safety Status] --> RF[Risk Fusion Engine]
-    AS[Anomaly Score w1=0.30] --> RF
-    PD[Population Deviation w2=0.25] --> RF
-    DR[Drift Risk Score w3=0.25] --> RF
-    CA[Correlation Anomaly w4=0.10] --> RF
-    UC[Uncertainty Penalty w5=0.05] --> RF
-    DQ[Data Quality Penalty w6=0.05] --> RF
-    RF --> RS[Risk Score 0-1]
-    RF --> SEV[Severity Level]
-    RF --> RC[Reason Codes]
-    RS --> DEC[Decision Engine]
-```
-
-### Diagram 7: MLOps Lifecycle
+### Diagram 6: Dynamic Anomaly Detection — Module A
 
 ```mermaid
 graph TD
-    DV[Data Versioning] --> DVL[Data Validation]
-    DVL --> FE[Feature Engineering]
-    FE --> TR[Model Training - MLflow autolog]
-    TR --> VAL[Validation - hold-out set]
-    VAL --> EVAL[Evaluation - Recall, FNR, MAE, R²]
-    EVAL --> |Pass metrics| MR[Model Registry - MLflow]
-    EVAL --> |Fail metrics| TR
-    MR --> APR[Approval - ML Engineer + QA]
-    APR --> DEP[Deployment - load artifact]
-    DEP --> INF[Inference - production]
-    INF --> MON[Monitoring - drift, performance]
-    MON --> |Drift detected| RTR[Retraining Trigger]
-    RTR --> DV
+    subgraph INPUT[Input per Component per Checkpoint]
+        FV[Feature Vector]
+    end
+    subgraph LAYER1[Layer 1 - Univariate Statistical]
+        ZS[Robust Z-score]
+        MAD[MAD Score]
+        PCT[Percentile in Lot]
+    end
+    subgraph LAYER2[Layer 2 - Multivariate ML]
+        IF[Isolation Forest]
+        MH[Mahalanobis Distance]
+    end
+    subgraph LAYER3[Layer 3 - Temporal]
+        SLP[Slope Analysis]
+        ACC[Acceleration Analysis]
+    end
+    subgraph OUTPUT[Module A Output]
+        AGG[Anomaly Score Aggregation]
+        ATYPE[Anomaly Type Classification]
+        CONF[Anomaly Confidence]
+    end
+    FV --> ZS & MAD & PCT
+    FV --> IF & MH
+    FV --> SLP & ACC
+    ZS & MAD & PCT --> AGG
+    IF & MH --> AGG
+    SLP & ACC --> AGG
+    AGG --> ATYPE --> CONF
 ```
 
-### Diagram 8: Database ER Diagram
+### Diagram 7: Drift Prediction — Module B
+
+```mermaid
+graph TD
+    subgraph INPUTS[Early Measurement Inputs]
+        V0[value_0h]
+        V24[value_24h]
+        SLP[slope_0h_to_24h]
+        TEMP[temperature_0h and 24h]
+        LSTATS[lot_mean and lot_std]
+    end
+    subgraph MODELS[Prediction Models]
+        RIDGE[Ridge Regression - Interpretable Baseline]
+        XGB[XGBoost - Primary Predictor]
+    end
+    subgraph UNCERTAINTY[Uncertainty Estimation]
+        QR[Quantile Regression - 5th and 95th percentile]
+        CI[95 percent Prediction Interval]
+    end
+    subgraph OUTPUT[Module B Output]
+        P168[Predicted 168h Value]
+        DRIFT[Predicted Drift]
+        RATE[Drift Rate]
+        MARGIN[Safety Margin]
+        RISK[Drift Risk Level]
+    end
+    V0 & V24 & SLP & TEMP & LSTATS --> RIDGE
+    V0 & V24 & SLP & TEMP & LSTATS --> XGB
+    XGB --> QR --> CI
+    XGB --> P168 --> DRIFT --> RATE --> MARGIN --> RISK
+```
+
+### Diagram 8: Risk Fusion Engine
+
+```mermaid
+graph TD
+    subgraph INPUTS[Risk Fusion Inputs]
+        HSS[Hard Safety Status - binary]
+        AS[Anomaly Score - w1 = 0.30]
+        PD[Population Deviation - w2 = 0.25]
+        DR[Drift Risk Score - w3 = 0.25]
+        CA[Correlation Anomaly - w4 = 0.10]
+        UC[Uncertainty Penalty - w5 = 0.05]
+        DQ[Data Quality Penalty - w6 = 0.05]
+    end
+    subgraph ENGINE[Risk Fusion Engine]
+        WF[Weighted Fusion Formula]
+        OR[Override Rule - Hard Limit = score 1.0]
+    end
+    subgraph OUTPUT[Fusion Output]
+        RS[Risk Score 0 to 1]
+        SEV[Severity - LOW / MEDIUM / HIGH / CRITICAL]
+        RC[Reason Codes JSON]
+    end
+    HSS --> OR --> WF
+    AS & PD & DR & CA & UC & DQ --> WF
+    WF --> RS --> SEV
+    WF --> RC
+    RS --> DEC[Decision Engine]
+```
+
+### Diagram 9: Explainability Pipeline
+
+```mermaid
+graph TD
+    subgraph INPUTS[Explainability Inputs]
+        FV[Feature Vector]
+        AS[Anomaly Score]
+        SHAP[SHAP Values from IF and XGBoost]
+        PRED[Drift Prediction]
+        LOT[Lot Statistics]
+    end
+    subgraph ENGINE[Explainability Engine]
+        FC[Feature Contribution Ranking]
+        NL[Natural Language Template]
+        TC[Trend Comparison vs Lot]
+        VIZ[Visualization Data]
+    end
+    subgraph OUTPUT[Explanation Output]
+        NAR[Narrative Text]
+        FEAT[Top Contributing Features]
+        CHART[Trend Chart Data]
+        DISC[Disclaimer]
+    end
+    FV --> SHAP --> FC --> NL --> NAR
+    AS --> FC
+    PRED --> NL
+    LOT --> TC --> VIZ --> CHART
+    NL --> FEAT
+    NAR --> DISC
+```
+
+### Diagram 10: Database ER Diagram
 
 ```mermaid
 erDiagram
@@ -2060,89 +2212,277 @@ erDiagram
     screening_results ||--o{ audit_logs : logged_in
 ```
 
-### Diagram 9: Deployment Architecture (SIH Demo)
+### Diagram 11: REST API Architecture
 
 ```mermaid
 graph TD
-    subgraph Docker Compose
-        FE[Next.js Frontend :3000]
-        BE[FastAPI Backend :8000]
-        DB[(TimescaleDB :5432)]
-        RD[(Redis :6379)]
-        MQ[MQTT Broker :1883]
-        ML[MLflow :5000]
-        GR[Grafana :3001]
-        PR[Prometheus :9090]
-        TG[Synthetic Telemetry Generator]
+    subgraph CLIENTS[API Clients]
+        FE[Frontend Dashboard]
+        DAQ[DAQ System]
+        ENG[Engineer CLI]
     end
-    FE --> BE
+    subgraph AUTH[Auth Layer]
+        JWT[JWT Middleware]
+        RBAC[RBAC Role Check]
+    end
+    subgraph ENDPOINTS[REST Endpoints]
+        E1[POST /api/v1/telemetry]
+        E2[POST /api/v1/telemetry/batch]
+        E3[POST /api/v1/screening/analyze]
+        E4[POST /api/v1/anomaly/detect]
+        E5[POST /api/v1/drift/predict]
+        E6[GET /api/v1/components/id]
+        E7[GET /api/v1/components/id/timeline]
+        E8[GET /api/v1/screening/test_id/result]
+        E9[GET /api/v1/models]
+        E10[GET /api/v1/health]
+    end
+    FE & DAQ & ENG --> JWT --> RBAC
+    RBAC --> E1 & E2 & E3 & E4 & E5
+    RBAC --> E6 & E7 & E8 & E9 & E10
+```
+
+### Diagram 12: Real-Time Architecture
+
+```mermaid
+graph TD
+    DAQ[DAQ System] -->|publish| MQTT[MQTT Broker - Mosquitto]
+    MQTT -->|subscribe| ING[Ingestion Service]
+    ING --> VAL[Validation Service]
+    VAL -->|VALID| PRE[Preprocessing Service]
+    VAL -->|INVALID| QUA[Quarantine Store]
+    PRE --> FEA[Feature Service]
+    FEA --> ML[ML Inference - Anomaly + Drift + Correlation]
+    ML --> RF[Risk Fusion Service]
+    RF --> DEC[Decision Engine]
+    DEC --> ALS[Alert Service]
+    ALS -->|WebSocket push| DASH[Engineering Dashboard]
+    DEC -->|async write| DB[(TimescaleDB + PostgreSQL)]
+    DEC --> AUD[Audit Log]
+```
+
+### Diagram 13: Batch Processing Architecture
+
+```mermaid
+graph TD
+    SRC[CSV / Parquet / JSON Upload] --> BAPI[Batch Ingestion API]
+    BAPI --> FVAL[File Validation - schema, format, encoding]
+    FVAL --> RVAL[Record-Level Validation]
+    RVAL -->|INVALID| QUA[Quarantine with Reason Codes]
+    RVAL -->|VALID| PRE[Preprocessing - vectorized pandas]
+    PRE --> FEA[Feature Engineering - batch]
+    FEA --> ML[ML Inference - batch predict]
+    ML --> RF[Risk Fusion - batch]
+    RF --> DEC[Decision Engine - batch]
+    DEC --> DB[(Database - bulk insert)]
+    DB --> RPT[Report Generation]
+    RPT --> NOTIF[Notification - batch complete]
+```
+
+### Diagram 14: MLOps Lifecycle
+
+```mermaid
+graph TD
+    DV[Data Versioning - Parquet snapshots] --> DVL[Data Validation]
+    DVL --> FE[Feature Engineering - versioned pipeline]
+    FE --> TR[Model Training - MLflow autolog]
+    TR --> VAL[Validation - hold-out set]
+    VAL --> EVAL[Evaluation - Recall, FNR, MAE, R2]
+    EVAL -->|Pass metrics| MR[Model Registry - MLflow]
+    EVAL -->|Fail metrics| TR
+    MR --> APR[Approval - ML Engineer and QA sign-off]
+    APR --> DEP[Deployment - artifact loaded by services]
+    DEP --> INF[Inference - production]
+    INF --> MON[Monitoring - PSI, KL divergence, error rate]
+    MON -->|Drift detected| RTR[Retraining Trigger - manual approval]
+    RTR --> DV
+```
+
+### Diagram 15: Deployment Architecture — SIH Demo
+
+```mermaid
+graph TD
+    subgraph DC[Docker Compose Host]
+        subgraph FRONTEND[Frontend]
+            FE[Next.js Dashboard - port 3000]
+        end
+        subgraph BACKEND[Backend]
+            BE[FastAPI Backend - port 8000]
+        end
+        subgraph DEMO[Demo Only]
+            TG[Synthetic Telemetry Generator]
+        end
+        subgraph DATA[Data Layer]
+            DB[(TimescaleDB - port 5432)]
+            RD[(Redis - port 6379)]
+        end
+        subgraph MESSAGING[Messaging]
+            MQ[MQTT Broker - port 1883]
+        end
+        subgraph MLOPS[MLOps]
+            ML[MLflow - port 5000]
+        end
+        subgraph MONITORING[Monitoring]
+            PR[Prometheus - port 9090]
+            GR[Grafana - port 3001]
+        end
+    end
+    FE -->|REST + WebSocket| BE
     BE --> DB
     BE --> RD
     BE --> ML
-    TG --> MQ
-    MQ --> BE
-    BE --> PR
-    PR --> GR
+    TG -->|MQTT publish| MQ
+    MQ -->|MQTT subscribe| BE
+    BE -->|metrics| PR
+    PR -->|datasource| GR
 ```
 
-### Diagram 10: Security Architecture
+### Diagram 16: Production Deployment Architecture
 
 ```mermaid
 graph TD
-    USER[User / Engineer] --> |HTTPS + JWT| API[FastAPI - Auth Middleware]
-    API --> |RBAC check| SVC[Services]
-    SVC --> |ORM - no raw SQL| DB[(PostgreSQL - TLS)]
-    SVC --> |TLS| RD[(Redis)]
-    SVC --> |TLS| ML[(MLflow)]
-    API --> |append-only| AUD[(Audit Logs)]
-    subgraph Network Segmentation
-        API
-        SVC
-        DB
-        RD
-        ML
+    subgraph FACILITY[Burn-In Facility - Physical]
+        CUT[Components Under Test]
+        BIC[Burn-In Chamber]
+        DAQ[DAQ System]
     end
+    subgraph EDGE[Edge Gateway]
+        EMQTT[Local MQTT Broker]
+        EVAL[Edge Validation]
+        EBUF[Local Buffer]
+        EHARD[Hard Safety Rules - Edge]
+    end
+    subgraph SERVER[Central AI Server]
+        ING[Telemetry Ingestion Cluster]
+        AI[AI Services Cluster]
+        DB[(TimescaleDB Cluster)]
+        MR[Model Registry - MLflow]
+    end
+    subgraph PRESENTATION[Presentation Layer]
+        DASH[Engineering Dashboard]
+        MON[Prometheus + Grafana]
+    end
+    CUT --> BIC --> DAQ
+    DAQ -->|MQTT| EMQTT --> EVAL --> EBUF
+    EBUF -->|TLS encrypted| ING
+    EHARD -->|preliminary decision| DASH
+    ING --> AI --> DB
+    AI --> MR
+    DB --> DASH
+    DB --> MON
 ```
 
-### Diagram 11: Failure / Fallback Architecture
+### Diagram 17: Security Architecture
+
+```mermaid
+graph TD
+    subgraph USERS[Users]
+        ADMIN[ADMIN]
+        QA[QA Engineer]
+        TEST[Test Engineer]
+        MLE[ML Engineer]
+        VIEW[Viewer]
+    end
+    subgraph AUTH[Authentication and Authorization]
+        JWT[JWT Bearer Token - HS256 - 8h expiry]
+        RBAC[RBAC Role Check per Endpoint]
+    end
+    subgraph SERVICES[Services - Network Segmented]
+        API[FastAPI - TLS 1.3]
+        SVC[Backend Services]
+        DB[(PostgreSQL - TDE)]
+        RD[(Redis - TLS)]
+        ML[(MLflow - TLS)]
+    end
+    subgraph AUDIT[Audit]
+        AUD[Audit Logs - append-only]
+    end
+    ADMIN & QA & TEST & MLE & VIEW --> JWT --> RBAC
+    RBAC --> API --> SVC
+    SVC --> DB & RD & ML
+    API --> AUD
+```
+
+### Diagram 18: Failure and Fallback Architecture
 
 ```mermaid
 flowchart TD
     TEL[Telemetry Arrives] --> ING[Ingestion Service]
-    ING --> |Schema invalid| QUA[Quarantine + Alert]
-    ING --> |Valid| VAL[Validation]
-    VAL --> |Quality fail| QUA2[Quarantine + Alert]
-    VAL --> |Quality pass| AI[AI Inference]
-    AI --> |Service available| FULL[Full AI Decision]
-    AI --> |Service unavailable| SAFE[MANUAL_REVIEW_REQUIRED\nHard Safety Rules Only]
-    FULL --> |Hard limit violated| FAIL[FAIL - Deterministic]
-    FULL --> |AI result| DEC[AI-Assisted Decision]
-    SAFE --> AUD[Audit Log - AI_UNAVAILABLE flag]
-    FAIL --> AUD
-    DEC --> AUD
+    ING -->|Schema invalid| QUA1[Quarantine + Alert]
+    ING -->|Schema valid| VAL[Validation Service]
+    VAL -->|Quality fail| QUA2[Quarantine + Data Quality Alert]
+    VAL -->|Quality pass| HSR[Hard Safety Rule Engine]
+    HSR -->|Limit violated| FAIL[FAIL - Deterministic]
+    HSR -->|Limit OK| AI{AI Services Available?}
+    AI -->|YES| FULL[Full AI Screening Decision]
+    AI -->|NO| SAFE[MANUAL REVIEW REQUIRED - Hard Rules Only]
+    FULL -->|Anomaly detected| FLAG[REVIEW or HIGH-RISK REVIEW]
+    FULL -->|No anomaly| NORM[NORMAL]
+    SAFE --> AUD1[Audit Log - AI_UNAVAILABLE flag]
+    FAIL --> AUD2[Audit Log - HARD_LIMIT_VIOLATED]
+    FLAG --> AUD3[Audit Log - AI decision]
+    NORM --> AUD3
 ```
 
-### Diagram 12: Component Health Timeline
+### Diagram 19: Auditability Trace Sequence
 
 ```mermaid
-gantt
-    title Component CUT-LOT42-007 Burn-In Timeline
-    dateFormat HH
-    axisFormat %Hh
+sequenceDiagram
+    participant TEL as Telemetry Record
+    participant DQ as Data Quality
+    participant HSR as Safety Rules
+    participant MODA as Anomaly Detection
+    participant MODB as Drift Prediction
+    participant COR as Correlation
+    participant RF as Risk Fusion
+    participant EXP as Explainability
+    participant DEC as Decision
+    participant ENG as Engineer Review
+    participant AUD as Audit Log
 
-    section Measurements
-    Baseline 0h measurement     :milestone, m1, 00, 0h
-    24h checkpoint              :milestone, m2, 24, 0h
-    96h checkpoint              :milestone, m3, 96, 0h
-    168h checkpoint             :milestone, m4, 168, 0h
+    TEL->>DQ: validate and score
+    DQ->>HSR: quality_score + clean data
+    HSR->>MODA: hard_safety_status
+    HSR->>MODB: hard_safety_status
+    MODA->>RF: anomaly_score + model_version
+    MODB->>RF: drift_risk + confidence
+    COR->>RF: correlation_score
+    RF->>EXP: risk_score + reason_codes
+    EXP->>DEC: explanation + narrative
+    DEC->>ENG: decision + explanation
+    ENG->>AUD: review_action + notes
+    DEC->>AUD: full immutable trace
+```
 
-    section AI Analysis
-    Anomaly detection at 24h    :crit, a1, 24, 1h
-    Drift prediction at 24h     :crit, a2, 24, 1h
-    Alert generated             :crit, a3, 25, 1h
+### Diagram 20: Component Health Timeline
 
-    section Engineer Review
-    Engineer review             :active, r1, 26, 4h
+```mermaid
+graph LR
+    subgraph T0[0h - Baseline]
+        M0[Measure all parameters]
+        B0[Establish lot baseline]
+    end
+    subgraph T24[24h - First Checkpoint]
+        M24[Measure all parameters]
+        A24[Run Anomaly Detection]
+        D24[Run Drift Prediction]
+        R24[Risk Fusion + Decision]
+    end
+    subgraph T96[96h - Second Checkpoint]
+        M96[Measure all parameters]
+        A96[Update Anomaly Score]
+        D96[Update Drift Prediction]
+        R96[Update Risk Score]
+    end
+    subgraph T168[168h - Final Checkpoint]
+        M168[Final measurements]
+        COMP[Compare predicted vs actual]
+        FINAL[Final Screening Decision]
+        RPT[Generate Report]
+    end
+    T0 --> T24 --> T96 --> T168
+    R24 -->|HIGH-RISK flag| ENG[Engineer Review]
+    ENG -->|Continue or Reject| T96
 ```
 
 
