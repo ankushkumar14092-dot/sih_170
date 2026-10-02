@@ -2790,3 +2790,1258 @@ The combination of all three in a single auditable engineering workflow — with
 *Prepared for: Smart India Hackathon Technical Presentation*
 *Data Classification: Prototype / Research*
 *All synthetic data clearly labeled as SYNTHETIC throughout*
+
+---
+
+# LOW-LEVEL DESIGN (LLD)
+# SIH26170 — AI-Driven Anomaly Detection in Component Burn-In & Screening
+
+---
+
+## LLD TABLE OF CONTENTS
+
+1. LLD-01: Telemetry Record Schema (Field-Level)
+2. LLD-02: Data Quality Engine — Rule Definitions
+3. LLD-03: Feature Engineering — Computation Logic
+4. LLD-04: Module A — Anomaly Detection Algorithm Flow
+5. LLD-05: Module B — Drift Prediction Algorithm Flow
+6. LLD-06: Correlation Analyzer — Algorithm Flow
+7. LLD-07: Risk Fusion Engine — Formula Detail
+8. LLD-08: Decision Engine — Precedence Logic
+9. LLD-09: Explainability Engine — Output Construction
+10. LLD-10: Ingestion Service — Internal Flow
+11. LLD-11: API Request/Response Contracts (Field-Level)
+12. LLD-12: Database Table Definitions (Column-Level)
+13. LLD-13: Redis Cache Schema
+14. LLD-14: MQTT Topic Structure
+15. LLD-15: MLflow Experiment and Run Schema
+16. LLD-16: Alert Schema and Routing Logic
+17. LLD-17: Audit Log Entry Schema
+18. LLD-18: Report Template Structure
+19. LLD-19: Fail-Safe State Machine
+20. LLD-20: LLD Mermaid Diagrams
+
+---
+
+## LLD-01: TELEMETRY RECORD SCHEMA (FIELD-LEVEL)
+
+Every telemetry record entering the system must conform to this schema.
+
+| Field | Type | Required | Validation | Description |
+|---|---|---|---|---|
+| component_id | string | YES | regex: `^[A-Z0-9\-]{4,64}$` | Unique component identifier |
+| test_id | string | YES | regex: `^[A-Z0-9\-]{4,64}$` | Test session identifier |
+| lot_id | string | YES | regex: `^[A-Z0-9\-]{4,64}$` | Lot identifier |
+| parameter | string | YES | enum: see Parameter Registry | Parameter name |
+| value | float | YES | finite, not NaN, not Inf | Measured value |
+| unit | string | YES | enum: uA, mA, ns, ps, V, mV, degC | Unit of measurement |
+| timestamp | ISO8601 string | YES | not future, not > 30 days old | Measurement timestamp (UTC) |
+| test_stage | string | YES | enum: 0h, 24h, 96h, 168h, intermediate | Burn-in checkpoint |
+| temperature | float | NO | -55.0 to 200.0 degC | Chamber temperature |
+| voltage | float | NO | 0.0 to 20.0 V | Applied voltage |
+| operating_condition | string | NO | enum: burn_in_stress, ambient, post_burnin | Test condition |
+| sensor_id | string | NO | max 64 chars | DAQ channel identifier |
+| data_quality_flag | string | AUTO | enum: VALID, QUARANTINE, SUSPECT | Set by ingestion pipeline |
+
+### Parameter Registry
+
+| Parameter Name | Unit | Physical Min | Physical Max | Description |
+|---|---|---|---|---|
+| leakage_current | uA | 0.0 | 10000.0 | Leakage current Ileak |
+| standby_current | mA | 0.0 | 1000.0 | Standby current Icc |
+| propagation_delay | ns | 0.0 | 10000.0 | Propagation delay tpd |
+| output_voltage_high | V | 0.0 | 20.0 | Output high voltage Voh |
+| output_voltage_low | V | 0.0 | 20.0 | Output low voltage Vol |
+| input_threshold_high | V | 0.0 | 20.0 | Input high threshold Vih |
+| input_threshold_low | V | 0.0 | 20.0 | Input low threshold Vil |
+| temperature | degC | -55.0 | 200.0 | Junction/chamber temperature |
+
+---
+
+## LLD-02: DATA QUALITY ENGINE — RULE DEFINITIONS
+
+The Data Quality Engine applies the following rules in order. First failing rule quarantines the record.
+
+| Rule ID | Rule Name | Condition | Action | Severity |
+|---|---|---|---|---|
+| DQ-01 | Missing Required Field | Any required field is null or absent | QUARANTINE | CRITICAL |
+| DQ-02 | Invalid Parameter Name | parameter not in Parameter Registry | QUARANTINE | HIGH |
+| DQ-03 | Physical Bounds Violation | value < physical_min OR value > physical_max | QUARANTINE | HIGH |
+| DQ-04 | Future Timestamp | timestamp > now() + 60s | QUARANTINE | HIGH |
+| DQ-05 | Stale Timestamp | timestamp < now() - 30 days | QUARANTINE | MEDIUM |
+| DQ-06 | Duplicate Record | (component_id, parameter, timestamp) already exists | DEDUPLICATE + LOG | LOW |
+| DQ-07 | Unit Mismatch | unit not matching parameter's expected unit | ATTEMPT CONVERSION, else QUARANTINE | MEDIUM |
+| DQ-08 | Stuck Sensor | Same value for >= 5 consecutive readings on same sensor_id | FLAG as SUSPECT + ALERT | HIGH |
+| DQ-09 | Missing Checkpoint | Component has no record for a checkpoint within ±30min window | FLAG as INCOMPLETE | MEDIUM |
+| DQ-10 | Excessive Missing | > 20% of parameters missing for a component at a checkpoint | BLOCK ML INFERENCE | HIGH |
+
+### Quality Score Computation
+
+```
+quality_score = 1.0
+  - 0.3 if DQ-08 triggered (stuck sensor)
+  - 0.2 if DQ-09 triggered (missing checkpoint)
+  - 0.1 per missing optional field (max 0.2)
+  - 0.4 if DQ-10 triggered (excessive missing)
+
+quality_score = max(0.0, quality_score)
+ML inference blocked if quality_score < 0.7  [ASSUMPTION — configurable]
+```
+
+---
+
+## LLD-03: FEATURE ENGINEERING — COMPUTATION LOGIC
+
+All features are computed per (component_id, test_id, parameter, checkpoint).
+
+### F-01: raw_value
+```
+raw_value = telemetry_clean.value_normalized
+            at (component_id, parameter, checkpoint)
+```
+
+### F-02: moving_avg_3pt
+```
+checkpoints_available = [v for v in [v_0h, v_24h, v_96h] if not null]
+moving_avg_3pt = mean(checkpoints_available[-3:])
+```
+
+### F-03: rolling_std
+```
+rolling_std = std(checkpoints_available[-3:])
+              returns null if < 2 values available
+```
+
+### F-04: slope_0h_to_now
+```
+slope_0h_to_now = (value_now - value_0h) / hours_elapsed
+hours_elapsed = {24h: 24, 96h: 96, 168h: 168}
+returns null if value_0h is null
+```
+
+### F-05: rate_of_change
+```
+rate_of_change = (value_current - value_previous) / delta_hours
+delta_hours = hours between current and previous checkpoint
+returns null if previous checkpoint unavailable
+```
+
+### F-06: acceleration
+```
+roc_current  = rate_of_change at current checkpoint
+roc_previous = rate_of_change at previous checkpoint
+acceleration = (roc_current - roc_previous) / delta_hours
+returns null if < 3 checkpoints available
+```
+
+### F-07: deviation_from_lot_mean
+```
+lot_mean = mean(value for all components in lot at same parameter, checkpoint)
+deviation_from_lot_mean = raw_value - lot_mean
+```
+
+### F-08: deviation_from_lot_median
+```
+lot_median = median(value for all components in lot at same parameter, checkpoint)
+deviation_from_lot_median = raw_value - lot_median
+```
+
+### F-09: robust_z_score
+```
+lot_median = median(lot values)
+MAD = median(|v - lot_median| for v in lot values)
+robust_z_score = (raw_value - lot_median) / (1.4826 * MAD)
+returns null if MAD == 0 (all lot values identical)
+[1.4826 is the consistency factor for normal distribution]
+```
+
+### F-10: percentile_in_lot
+```
+percentile_in_lot = percentileofscore(lot_values, raw_value, kind='rank')
+range: 0.0 to 100.0
+```
+
+### F-11: temp_normalized_value
+```
+alpha = parameter_temperature_coefficient  [ASSUMPTION — parameter-specific]
+T_ref = 25.0  [reference temperature in degC]
+temp_normalized_value = raw_value / (1 + alpha * (temperature - T_ref))
+returns raw_value if temperature is null or alpha is undefined
+```
+
+### F-12: value_range_0h_to_now
+```
+value_range_0h_to_now = max(available_values) - min(available_values)
+```
+
+### F-13: trend_direction
+```
+if slope_0h_to_now > +epsilon:  trend_direction = +1  (increasing)
+if slope_0h_to_now < -epsilon:  trend_direction = -1  (decreasing)
+else:                           trend_direction =  0  (stable)
+epsilon = 0.001 * lot_median  [ASSUMPTION — relative threshold]
+```
+
+### Lot Statistics (cached in Redis, TTL = 1 hour)
+```
+key: lot_stats:{lot_id}:{parameter}:{checkpoint}
+value: {
+  mean, median, std, mad,
+  min, max,
+  p5, p25, p75, p95,
+  iqr, n_components
+}
+```
+
+---
+
+## LLD-04: MODULE A — ANOMALY DETECTION ALGORITHM FLOW
+
+```
+INPUT: feature_vector (F-01 through F-13) for one component at one checkpoint
+
+STEP 1 — Univariate Statistical Layer
+  robust_z = F-09 (robust_z_score)
+  pct      = F-10 (percentile_in_lot)
+
+  stat_anomaly_flag = (abs(robust_z) > Z_THRESHOLD)  [default Z_THRESHOLD=3.0, configurable]
+  stat_score = min(1.0, abs(robust_z) / 5.0)         [normalize to 0-1]
+
+STEP 2 — Isolation Forest Layer
+  model = load_production_model('isolation_forest', component_type, lot_id)
+  IF model not available for lot:
+      model = load_production_model('isolation_forest', component_type)  [type-level fallback]
+  IF model not available:
+      isolation_score = null  [flag as MODEL_UNAVAILABLE]
+  ELSE:
+      raw_if_score = model.decision_function([feature_vector])
+      isolation_score = normalize_if_score(raw_if_score)  [map to 0-1, higher = more anomalous]
+
+STEP 3 — Mahalanobis Distance Layer
+  cov_matrix = lot_covariance_matrix(lot_id, checkpoint)  [from Redis cache]
+  IF cov_matrix not available OR n_components < 10:
+      mahal_score = null
+  ELSE:
+      mahal_dist = mahalanobis(feature_vector, lot_mean_vector, inv(cov_matrix))
+      mahal_score = chi2_pvalue_to_score(mahal_dist, df=n_features)
+
+STEP 4 — Temporal Anomaly Layer
+  slope     = F-04 (slope_0h_to_now)
+  accel     = F-06 (acceleration)
+  temporal_score = 0.0
+  IF abs(slope) > SLOPE_THRESHOLD:     temporal_score += 0.4
+  IF accel > ACCEL_THRESHOLD:          temporal_score += 0.3
+  IF trend_direction changes sign:     temporal_score += 0.3
+  temporal_score = min(1.0, temporal_score)
+
+STEP 5 — Score Aggregation
+  available_scores = [s for s in [stat_score, isolation_score, mahal_score, temporal_score]
+                      if s is not null]
+  IF len(available_scores) == 0:
+      anomaly_score = null
+      anomaly_type  = 'DETECTION_UNAVAILABLE'
+  ELSE:
+      weights = [0.25, 0.35, 0.25, 0.15]  [stat, IF, mahal, temporal — configurable]
+      anomaly_score = weighted_average(available_scores, weights)
+
+STEP 6 — Anomaly Type Classification
+  IF mahal_score > MAHAL_THRESHOLD:    anomaly_type = 'MULTIVARIATE'
+  ELIF temporal_score > 0.6:           anomaly_type = 'TEMPORAL'
+  ELIF stat_score > 0.6:               anomaly_type = 'POPULATION_OUTLIER'
+  ELSE:                                anomaly_type = 'COMPOSITE'
+
+OUTPUT:
+  anomaly_score        [0.0 - 1.0]
+  population_deviation [robust_z_score]
+  anomaly_confidence   [fraction of layers agreeing]
+  anomaly_type         [POPULATION_OUTLIER | TEMPORAL | MULTIVARIATE | COMPOSITE]
+```
+
+---
+
+## LLD-05: MODULE B — DRIFT PREDICTION ALGORITHM FLOW
+
+```
+INPUT: component measurements at 0h and 24h for one parameter
+
+STEP 1 — Input Validation
+  REQUIRE: value_0h is not null
+  REQUIRE: value_24h is not null
+  IF either missing: return PREDICTION_UNAVAILABLE
+
+STEP 2 — Input Feature Construction
+  input_features = {
+    value_0h,
+    value_24h,
+    slope_0h_to_24h   = (value_24h - value_0h) / 24.0,
+    roc_0h_to_24h     = slope_0h_to_24h,
+    temperature_0h,
+    temperature_24h,
+    component_type_enc = label_encode(component_type),
+    lot_mean_0h        = lot_stats[0h].mean,
+    lot_mean_24h       = lot_stats[24h].mean,
+    lot_std_0h         = lot_stats[0h].std
+  }
+
+STEP 3 — Ridge Regression Baseline
+  ridge_model = load_model('ridge_drift_predictor', parameter)
+  ridge_pred  = ridge_model.predict([input_features])[0]
+
+STEP 4 — XGBoost Primary Prediction
+  xgb_model   = load_model('xgboost_drift_predictor', parameter)
+  xgb_pred    = xgb_model.predict([input_features])[0]
+
+  xgb_lower   = load_model('xgboost_quantile_0.025', parameter).predict([input_features])[0]
+  xgb_upper   = load_model('xgboost_quantile_0.975', parameter).predict([input_features])[0]
+
+STEP 5 — Sanity Check
+  IF abs(xgb_pred - ridge_pred) > SANITY_THRESHOLD * lot_std:
+      prediction_confidence *= 0.7  [penalize large disagreement between models]
+      flag = 'MODEL_DISAGREEMENT'
+
+STEP 6 — Drift Metrics
+  predicted_168h_value = xgb_pred
+  predicted_drift      = xgb_pred - value_0h
+  drift_rate           = predicted_drift / 168.0  [per hour]
+  absolute_limit       = parameter_limits[parameter][component_type]
+  safety_margin        = absolute_limit - xgb_pred
+  safety_margin_pct    = (safety_margin / absolute_limit) * 100.0
+
+STEP 7 — Drift Risk Classification  [ASSUMPTION — thresholds require calibration]
+  IF xgb_pred > 0.90 * absolute_limit:  drift_risk = 'HIGH'
+  ELIF xgb_pred > 0.80 * absolute_limit: drift_risk = 'ELEVATED'
+  ELIF xgb_pred > 0.65 * absolute_limit: drift_risk = 'MODERATE'
+  ELSE:                                   drift_risk = 'LOW'
+
+STEP 8 — Confidence Estimation
+  interval_width = xgb_upper - xgb_lower
+  relative_width = interval_width / abs(xgb_pred) if xgb_pred != 0 else 1.0
+  prediction_confidence = max(0.0, 1.0 - relative_width)
+
+OUTPUT:
+  predicted_168h_value, predicted_drift, drift_rate,
+  safety_margin, safety_margin_pct, drift_risk,
+  lower_bound_95, upper_bound_95, prediction_confidence
+```
+
+---
+
+## LLD-06: CORRELATION ANALYZER — ALGORITHM FLOW
+
+```
+INPUT: feature vectors for ALL parameters of one component at one checkpoint
+
+STEP 1 — Multi-Parameter Feature Matrix
+  param_vector = [value_norm(param) for param in MONITORED_PARAMETERS]
+  MONITORED_PARAMETERS = [leakage_current, standby_current,
+                           propagation_delay, output_voltage_high,
+                           output_voltage_low]
+
+STEP 2 — Lot Covariance Matrix
+  lot_matrix = matrix of param_vectors for all components in lot at checkpoint
+  IF n_components < 10: return CORRELATION_UNAVAILABLE
+  cov_matrix = robust_covariance(lot_matrix)  [MinCovDet for robustness]
+  inv_cov    = inv(cov_matrix)
+  lot_mean   = median(lot_matrix, axis=0)
+
+STEP 3 — Mahalanobis Distance
+  mahal_dist = sqrt((param_vector - lot_mean) @ inv_cov @ (param_vector - lot_mean).T)
+
+STEP 4 — Statistical Significance
+  df = len(MONITORED_PARAMETERS)
+  p_value = 1 - chi2.cdf(mahal_dist**2, df)
+  correlation_anomaly_flag = (p_value < 0.01)  [ASSUMPTION — configurable]
+  correlation_score = 1.0 - p_value  [higher = more anomalous]
+
+STEP 5 — Flagged Parameter Combinations
+  shap_values = shap_explainer.shap_values(param_vector)
+  flagged_params = top_k_by_abs_shap(shap_values, k=3)
+
+OUTPUT:
+  correlation_score        [0.0 - 1.0]
+  mahalanobis_distance     [float]
+  p_value                  [float]
+  correlation_anomaly_flag [bool]
+  flagged_parameters       [list of parameter names]
+```
+
+---
+
+## LLD-07: RISK FUSION ENGINE — FORMULA DETAIL
+
+```
+INPUTS:
+  hard_safety_status    ∈ {PASS, FAIL}
+  anomaly_score         ∈ [0.0, 1.0]   (null if unavailable)
+  population_deviation  = robust_z_score (float)
+  drift_risk_score      ∈ [0.0, 1.0]   (null if unavailable)
+  correlation_score     ∈ [0.0, 1.0]   (null if unavailable)
+  prediction_confidence ∈ [0.0, 1.0]   (null if unavailable)
+  data_quality_score    ∈ [0.0, 1.0]
+
+STEP 1 — Hard Safety Override
+  IF hard_safety_status == FAIL:
+      RETURN risk_score=1.0, severity=CRITICAL, decision=FAIL
+      [AI layer is bypassed entirely]
+
+STEP 2 — Handle Unavailable Scores (Conservative Defaults)
+  IF anomaly_score is null:        anomaly_score = 0.5        [conservative]
+  IF drift_risk_score is null:     drift_risk_score = 0.5     [conservative]
+  IF correlation_score is null:    correlation_score = 0.3    [conservative]
+  IF prediction_confidence is null: prediction_confidence = 0.5
+
+STEP 3 — Normalize Population Deviation
+  norm_pop_dev = min(1.0, abs(population_deviation) / 5.0)
+  [5-sigma maps to 1.0]
+
+STEP 4 — Uncertainty Penalty
+  uncertainty_penalty = (1.0 - prediction_confidence) * drift_risk_score
+
+STEP 5 — Data Quality Penalty
+  dq_penalty = (1.0 - data_quality_score)
+
+STEP 6 — Weighted Fusion  [ASSUMPTION — weights require calibration on real data]
+  w1, w2, w3, w4, w5, w6 = 0.30, 0.25, 0.25, 0.10, 0.05, 0.05
+
+  risk_score = (w1 * anomaly_score
+              + w2 * norm_pop_dev
+              + w3 * drift_risk_score
+              + w4 * correlation_score
+              + w5 * uncertainty_penalty
+              + w6 * dq_penalty)
+
+  risk_score = min(1.0, max(0.0, risk_score))
+
+STEP 7 — Severity Mapping  [ASSUMPTION — thresholds require calibration]
+  IF risk_score >= 0.85:  severity = CRITICAL
+  ELIF risk_score >= 0.60: severity = HIGH
+  ELIF risk_score >= 0.40: severity = MEDIUM
+  ELSE:                    severity = LOW
+
+STEP 8 — Reason Code Generation
+  reason_codes = []
+  IF abs(population_deviation) > 3.0:
+      reason_codes.append(f"POPULATION_OUTLIER_{parameter}_{population_deviation:.1f}_SIGMA")
+  IF drift_risk_score > 0.70:
+      reason_codes.append(f"ELEVATED_DRIFT_RATE_{parameter}")
+  IF predicted_168h > 0.80 * absolute_limit:
+      pct = int((predicted_168h / absolute_limit) * 100)
+      reason_codes.append(f"PREDICTED_168H_NEAR_LIMIT_{pct}_PERCENT")
+  IF correlation_score > 0.70:
+      reason_codes.append("MULTIVARIATE_CORRELATION_ANOMALY")
+  IF data_quality_score < 0.80:
+      reason_codes.append("DATA_QUALITY_DEGRADED")
+
+OUTPUT:
+  risk_score    [0.0 - 1.0]
+  severity      [LOW | MEDIUM | HIGH | CRITICAL]
+  reason_codes  [list of strings]
+```
+
+---
+
+## LLD-08: DECISION ENGINE — PRECEDENCE LOGIC
+
+```
+INPUTS:
+  hard_safety_status    ∈ {PASS, FAIL}
+  risk_score            ∈ [0.0, 1.0]
+  drift_risk_score      ∈ [0.0, 1.0]
+  data_quality_score    ∈ [0.0, 1.0]
+  ai_services_available ∈ {True, False}
+
+DECISION TREE (evaluated in strict order):
+
+  RULE 1 — Hard Safety Limit [DETERMINISTIC, CANNOT BE OVERRIDDEN]
+    IF hard_safety_status == FAIL:
+        decision = FAIL
+        severity = CRITICAL
+        ai_overridable = False
+        RETURN
+
+  RULE 2 — AI Service Unavailable [FAIL-SAFE]
+    IF NOT ai_services_available:
+        decision = MANUAL_REVIEW_REQUIRED
+        severity = UNKNOWN
+        reason   = AI_SERVICE_UNAVAILABLE_CONSERVATIVE_FALLBACK
+        RETURN
+
+  RULE 3 — Data Quality Gate [FAIL-SAFE]
+    IF data_quality_score < DATA_QUALITY_MIN (default 0.7):
+        decision = MANUAL_REVIEW_REQUIRED
+        severity = UNKNOWN
+        reason   = INSUFFICIENT_DATA_QUALITY_FOR_AI_INFERENCE
+        RETURN
+
+  RULE 4 — Critical Risk
+    IF risk_score >= FAIL_THRESHOLD (default 0.85):
+        decision = HIGH_RISK_REVIEW
+        severity = CRITICAL
+        RETURN
+
+  RULE 5 — Elevated Drift
+    IF drift_risk_score >= DRIFT_THRESHOLD (default 0.70):
+        decision = EARLY_INVESTIGATION
+        severity = HIGH
+        RETURN
+
+  RULE 6 — Moderate Anomaly
+    IF risk_score >= REVIEW_THRESHOLD (default 0.40):
+        decision = REVIEW
+        severity = MEDIUM
+        RETURN
+
+  RULE 7 — Normal
+    decision = NORMAL
+    severity = LOW
+
+ALL THRESHOLDS ARE CONFIGURABLE VIA ENVIRONMENT VARIABLES.
+ALL THRESHOLDS REQUIRE CALIBRATION ON VALIDATED REAL DATA BEFORE OPERATIONAL USE.
+[ASSUMPTION — prototype defaults only]
+```
+
+---
+
+## LLD-09: EXPLAINABILITY ENGINE — OUTPUT CONSTRUCTION
+
+```
+INPUTS:
+  component_id, lot_id, parameter, checkpoint
+  feature_vector
+  anomaly_score, anomaly_type
+  shap_values_anomaly   [from Isolation Forest SHAP TreeExplainer]
+  shap_values_drift     [from XGBoost SHAP TreeExplainer]
+  drift_prediction      [Module B output]
+  lot_stats             [median, mad, mean, std]
+  decision, reason_codes
+
+STEP 1 — Feature Contribution Ranking
+  all_shap = merge(shap_values_anomaly, shap_values_drift)
+  top_features = sort by abs(shap_value) descending, take top 5
+
+STEP 2 — Evidence Assembly
+  evidence = {
+    observed_value:          feature_vector.raw_value,
+    lot_median:              lot_stats.median,
+    deviation_sigma:         feature_vector.robust_z_score,
+    percentile_in_lot:       feature_vector.percentile_in_lot,
+    trend:                   map(trend_direction → INCREASING/STABLE/DECREASING),
+    drift_rate:              drift_prediction.drift_rate,
+    predicted_168h:          drift_prediction.predicted_168h_value,
+    prediction_confidence:   drift_prediction.prediction_confidence,
+    lower_bound_95:          drift_prediction.lower_bound_95,
+    upper_bound_95:          drift_prediction.upper_bound_95,
+    absolute_limit:          parameter_limits[parameter],
+    safety_margin_pct:       drift_prediction.safety_margin_pct
+  }
+
+STEP 3 — Narrative Generation (Template-Based)
+  template = select_template(anomaly_type, decision)
+
+  Example template for POPULATION_OUTLIER + HIGH_RISK_REVIEW:
+  "{parameter} remained below the absolute limit
+   ({observed_value} {unit} vs limit {absolute_limit} {unit})
+   but deviated substantially from the lot median ({lot_median} {unit}),
+   corresponding to a robust Z-score of {deviation_sigma:.2f}.
+   The parameter shows a {trend} trend.
+   The predicted 168h value is {predicted_168h} {unit}
+   (95% CI: {lower_bound_95}–{upper_bound_95} {unit}),
+   with a safety margin of {safety_margin_pct:.1f}% from the absolute limit."
+
+STEP 4 — Disclaimer Append
+  narrative += "\n\nDISCLAIMER: This explanation is generated by an AI assistive system.
+                It does not constitute a certified screening decision.
+                Final disposition is the responsibility of the qualified engineer."
+
+OUTPUT: explanation JSON (see Section 22 for full schema)
+```
+
+---
+
+## LLD-10: INGESTION SERVICE — INTERNAL FLOW
+
+```
+ENTRY POINTS:
+  A. POST /api/v1/telemetry          → single record REST
+  B. POST /api/v1/telemetry/batch    → file upload (CSV/JSON/Parquet)
+  C. MQTT subscriber                 → topic: burnin/telemetry/#
+
+SINGLE RECORD FLOW (Entry A and C):
+  1. Parse JSON body / MQTT payload
+  2. Pydantic schema validation → 422 if invalid
+  3. Enrich: add ingestion_timestamp = now()
+  4. Write to telemetry_raw (TimescaleDB)
+  5. Publish to internal queue (Redis List: queue:validation)
+  6. Return 202 Accepted with record_id
+
+BATCH FLOW (Entry B):
+  1. Receive file (multipart/form-data)
+  2. Detect format (CSV / JSON / Parquet) by extension + magic bytes
+  3. Parse into DataFrame
+  4. Validate each row with Pydantic model
+  5. Separate VALID rows and INVALID rows
+  6. Bulk insert VALID rows to telemetry_raw
+  7. Write INVALID rows to quarantine_records table with reason
+  8. Publish batch_id to queue:batch_processing
+  9. Return 202 with {batch_id, records_accepted, records_rejected}
+
+MQTT RECONNECT LOGIC:
+  on_disconnect:
+    wait = min(2^attempt * 1s, 60s)  [exponential backoff, max 60s]
+    reconnect()
+    attempt += 1
+
+ERROR HANDLING:
+  Database unavailable → buffer to local file queue, alert, retry
+  Queue full           → backpressure: return 503 to REST callers
+  Parse error          → quarantine with PARSE_ERROR reason
+```
+
+---
+
+## LLD-11: API REQUEST/RESPONSE CONTRACTS (FIELD-LEVEL)
+
+### POST /api/v1/telemetry
+
+Request Body (all fields):
+```
+component_id      string  required  Component identifier
+test_id           string  required  Test session identifier
+lot_id            string  required  Lot identifier
+parameter         string  required  Parameter name (from registry)
+value             float   required  Measured value
+unit              string  required  Unit of measurement
+timestamp         string  required  ISO8601 UTC timestamp
+test_stage        string  required  0h | 24h | 96h | 168h | intermediate
+temperature       float   optional  Chamber temperature in degC
+voltage           float   optional  Applied voltage in V
+operating_condition string optional burn_in_stress | ambient | post_burnin
+sensor_id         string  optional  DAQ channel identifier
+```
+
+Response 202:
+```
+record_id         string  UUID of stored record
+status            string  ACCEPTED
+quality_flag      string  VALID | SUSPECT
+ingestion_timestamp string ISO8601 UTC
+```
+
+Response 422 (validation error):
+```
+detail            array   List of field-level validation errors
+  loc             array   Field path
+  msg             string  Error message
+  type            string  Error type
+```
+
+### POST /api/v1/screening/analyze
+
+Request Body:
+```
+component_id  string  required
+test_id       string  required
+checkpoint    string  required  0h | 24h | 96h | 168h
+```
+
+Response 200:
+```
+result_id             string   UUID
+component_id          string
+test_id               string
+checkpoint            string
+hard_safety_status    string   PASS | FAIL
+anomaly_score         float    0.0 - 1.0 (null if unavailable)
+drift_risk_score      float    0.0 - 1.0 (null if unavailable)
+correlation_score     float    0.0 - 1.0 (null if unavailable)
+risk_score            float    0.0 - 1.0
+severity              string   LOW | MEDIUM | HIGH | CRITICAL
+decision              string   NORMAL | REVIEW | EARLY_INVESTIGATION |
+                               HIGH_RISK_REVIEW | FAIL | MANUAL_REVIEW_REQUIRED
+reason_codes          array    List of reason code strings
+explanation           object   Full explanation JSON (see LLD-09)
+model_version         string   Active model version tag
+decided_at            string   ISO8601 UTC
+disclaimer            string   Mandatory advisory disclaimer
+```
+
+Response 404: Component or test not found
+Response 409: Insufficient data for analysis (< 2 checkpoints)
+Response 503: AI services unavailable (returns conservative decision)
+
+---
+
+## LLD-12: DATABASE TABLE DEFINITIONS (COLUMN-LEVEL)
+
+### telemetry_raw (TimescaleDB hypertable)
+
+| Column | Type | Constraint | Index |
+|---|---|---|---|
+| id | BIGSERIAL | PK (composite with timestamp) | — |
+| component_id | UUID | NOT NULL, FK→components | idx_telemetry_raw_component |
+| test_id | UUID | NOT NULL, FK→tests | — |
+| lot_id | UUID | NOT NULL, FK→lots | idx_telemetry_raw_lot_param |
+| parameter | VARCHAR(64) | NOT NULL | idx_telemetry_raw_lot_param |
+| value | NUMERIC(18,6) | NOT NULL | — |
+| unit | VARCHAR(16) | NOT NULL | — |
+| timestamp | TIMESTAMPTZ | NOT NULL, partition key | idx_telemetry_raw_component |
+| test_stage | VARCHAR(16) | NOT NULL, CHECK enum | idx_telemetry_raw_lot_param |
+| temperature | NUMERIC(6,2) | nullable | — |
+| voltage | NUMERIC(6,3) | nullable | — |
+| operating_condition | VARCHAR(64) | nullable | — |
+| sensor_id | VARCHAR(64) | nullable | — |
+| data_quality_flag | VARCHAR(16) | NOT NULL DEFAULT 'VALID' | — |
+| ingestion_timestamp | TIMESTAMPTZ | NOT NULL DEFAULT NOW() | — |
+
+### screening_results
+
+| Column | Type | Constraint | Notes |
+|---|---|---|---|
+| result_id | UUID | PK DEFAULT uuid_generate_v4() | — |
+| component_id | UUID | NOT NULL FK→components | — |
+| test_id | UUID | NOT NULL FK→tests | — |
+| hard_safety_status | VARCHAR(8) | NOT NULL CHECK IN (PASS,FAIL) | Deterministic |
+| anomaly_score | NUMERIC(6,4) | nullable | null = service unavailable |
+| drift_risk_score | NUMERIC(6,4) | nullable | null = service unavailable |
+| correlation_score | NUMERIC(6,4) | nullable | null = service unavailable |
+| data_quality_score | NUMERIC(6,4) | NOT NULL | — |
+| risk_score | NUMERIC(6,4) | NOT NULL | Fused score |
+| severity | VARCHAR(16) | NOT NULL CHECK enum | — |
+| decision | VARCHAR(32) | NOT NULL CHECK enum | — |
+| reason_codes | JSONB | nullable | Array of strings |
+| model_version_id | UUID | FK→model_versions | nullable |
+| decided_at | TIMESTAMPTZ | NOT NULL DEFAULT NOW() | — |
+| reviewed_by | VARCHAR(128) | nullable | Engineer who reviewed |
+| review_action | VARCHAR(32) | nullable | ACCEPTED/ESCALATED/DISMISSED |
+| review_timestamp | TIMESTAMPTZ | nullable | — |
+| review_notes | TEXT | nullable | — |
+
+---
+
+## LLD-13: REDIS CACHE SCHEMA
+
+| Key Pattern | Type | TTL | Content |
+|---|---|---|---|
+| `lot_stats:{lot_id}:{parameter}:{checkpoint}` | Hash | 1 hour | mean, median, std, mad, min, max, p5, p95, iqr, n |
+| `model:active:{model_type}:{component_type}` | String | 5 minutes | model_version_id |
+| `session:{session_id}` | Hash | 8 hours | user_id, role, expires_at |
+| `queue:validation` | List | — | Pending telemetry record IDs |
+| `queue:batch_processing` | List | — | Pending batch_ids |
+| `health:services` | Hash | 30 seconds | service_name → UP/DOWN |
+| `rate_limit:{ip}:{endpoint}` | Counter | 1 minute | Request count for rate limiting |
+
+---
+
+## LLD-14: MQTT TOPIC STRUCTURE
+
+```
+Topic hierarchy:
+  burnin/telemetry/{lot_id}/{component_id}/{parameter}
+
+Examples:
+  burnin/telemetry/LOT-2024-042/CUT-007/leakage_current
+  burnin/telemetry/LOT-2024-042/CUT-007/standby_current
+  burnin/telemetry/+/+/+          ← wildcard subscription (ingestion service)
+
+QoS Levels:
+  Telemetry publish:  QoS 1 (at least once) — ensures no data loss
+  Alert subscribe:    QoS 1
+
+Payload format: JSON (see LLD-01 telemetry schema)
+Max payload size: 4KB
+Retained messages: NO (telemetry is time-sensitive)
+
+System topics:
+  burnin/system/health/{service_name}   ← service heartbeat
+  burnin/system/alert/{severity}        ← system alerts
+```
+
+---
+
+## LLD-15: MLFLOW EXPERIMENT AND RUN SCHEMA
+
+### Experiment Structure
+```
+Experiment: burnin_anomaly_detection
+  Run: isolation_forest_{component_type}_{lot_id}_{timestamp}
+    Parameters:
+      n_estimators:     100
+      contamination:    0.05
+      max_features:     1.0
+      random_state:     42
+      component_type:   74HC00
+      lot_id:           LOT-2024-042
+      data_version:     v1.2.0
+      feature_set:      v1.0
+    Metrics:
+      recall:           0.87
+      precision:        0.72
+      f1:               0.79
+      false_negative_rate: 0.13
+      pr_auc:           0.84
+      roc_auc:          0.91
+      n_train_samples:  180
+      n_anomalies_injected: 18
+    Artifacts:
+      model/            serialized IsolationForest (joblib)
+      shap_explainer/   SHAP TreeExplainer
+      feature_names.json
+      lot_statistics.json
+      evaluation_report.html
+
+Experiment: burnin_drift_prediction
+  Run: xgboost_drift_{parameter}_{timestamp}
+    Parameters:
+      n_estimators:     200
+      max_depth:        4
+      learning_rate:    0.05
+      subsample:        0.8
+      parameter:        leakage_current
+      data_version:     v1.2.0
+    Metrics:
+      mae:              1.82
+      rmse:             2.41
+      r2:               0.91
+      coverage_95ci:    0.94
+      n_train_samples:  450
+    Artifacts:
+      model/            serialized XGBoost (joblib)
+      model_q025/       quantile 0.025 model
+      model_q975/       quantile 0.975 model
+      shap_explainer/
+      feature_importance.json
+```
+
+### Model Registry States
+```
+STAGING    → model trained, metrics computed, awaiting review
+PRODUCTION → approved by ML Engineer + QA Engineer, serving inference
+ARCHIVED   → superseded by newer version, retained for audit/rollback
+```
+
+---
+
+## LLD-16: ALERT SCHEMA AND ROUTING LOGIC
+
+### Alert Record Schema
+
+| Field | Type | Description |
+|---|---|---|
+| alert_id | UUID | Unique alert identifier |
+| component_id | UUID | Component that triggered alert (nullable for system alerts) |
+| test_id | UUID | Test session (nullable) |
+| alert_type | string | HARD_LIMIT_VIOLATION / POPULATION_OUTLIER / ELEVATED_DRIFT / MULTIVARIATE_ANOMALY / DATA_QUALITY / AI_SERVICE_DOWN / MODEL_DRIFT |
+| severity | string | INFO / WARNING / HIGH / CRITICAL |
+| message | string | Human-readable alert message |
+| acknowledged | boolean | Default false |
+| acknowledged_by | string | Engineer username |
+| acknowledged_at | TIMESTAMPTZ | Acknowledgement timestamp |
+| created_at | TIMESTAMPTZ | Alert creation timestamp |
+
+### Alert Routing Logic
+
+```
+TRIGGER: Decision Engine produces non-NORMAL decision
+
+STEP 1 — Create alert record in database
+
+STEP 2 — Route by severity:
+  CRITICAL (FAIL / HARD_LIMIT_VIOLATION):
+    → Dashboard real-time push (WebSocket)
+    → Email to QA_ENGINEER role (if configured)
+    → Webhook POST to configured endpoint (if configured)
+
+  HIGH (HIGH_RISK_REVIEW / ELEVATED_DRIFT):
+    → Dashboard real-time push (WebSocket)
+    → Email to QA_ENGINEER role (if configured)
+
+  MEDIUM (REVIEW):
+    → Dashboard real-time push (WebSocket)
+
+  INFO (DATA_QUALITY / AI_SERVICE_DOWN):
+    → Dashboard system panel
+    → Email to ADMIN + ML_ENGINEER (if configured)
+
+STEP 3 — Retry logic for notifications:
+  Max retries: 3
+  Backoff: 5s, 30s, 120s
+  On final failure: log to audit trail, mark as NOTIFICATION_FAILED
+
+STEP 4 — Auto-escalation:
+  IF alert not acknowledged within 30 minutes AND severity == CRITICAL:
+    escalate to ADMIN role
+    [ASSUMPTION — escalation timeout configurable]
+```
+
+---
+
+## LLD-17: AUDIT LOG ENTRY SCHEMA
+
+Every screening decision writes one immutable audit log entry.
+
+| Field | Type | Description |
+|---|---|---|
+| log_id | UUID | Unique log entry identifier |
+| entity_type | string | SCREENING_DECISION / TELEMETRY_INGESTION / MODEL_DEPLOYMENT / USER_ACTION |
+| entity_id | UUID | ID of the entity (result_id, record_id, etc.) |
+| action | string | DECISION_MADE / RECORD_INGESTED / MODEL_DEPLOYED / REVIEW_SUBMITTED |
+| actor | string | Service name or engineer username |
+| input_reference_json | JSONB | References to input telemetry record IDs |
+| feature_values_json | JSONB | Snapshot of feature vector used for inference |
+| model_version_id | UUID | Model version used for inference |
+| prediction_json | JSONB | Full Module B prediction output |
+| anomaly_score | NUMERIC | Anomaly score at time of decision |
+| decision | string | Final decision label |
+| explanation_json | JSONB | Full explanation output |
+| timestamp | TIMESTAMPTZ | Immutable creation timestamp |
+| session_id | string | API session identifier |
+| ip_address | INET | Client IP address |
+
+### Immutability Enforcement
+```sql
+-- PostgreSQL rules prevent UPDATE and DELETE
+CREATE RULE audit_no_update AS ON UPDATE TO audit_logs DO INSTEAD NOTHING;
+CREATE RULE audit_no_delete AS ON DELETE TO audit_logs DO INSTEAD NOTHING;
+-- Application layer: audit_logs table user has INSERT-only permission
+```
+
+### Reproducibility
+Given the same `entity_id` and `model_version_id`, the system can:
+1. Retrieve the original feature vector from `feature_values_json`
+2. Load the exact model version from the model registry
+3. Re-run inference and verify the decision matches
+
+---
+
+## LLD-18: REPORT TEMPLATE STRUCTURE
+
+### Screening Report Sections
+
+```
+SECTION 1 — Report Header
+  Report ID, generated_at, generated_by, model_version
+  Test ID, Lot ID, Component Type
+  Disclaimer (mandatory)
+
+SECTION 2 — Lot Summary Table
+  Total components | NORMAL | REVIEW | HIGH-RISK | FAIL | MANUAL-REVIEW
+  Lot statistics per parameter (mean, std, min, max)
+  Pass rate, Anomaly rate
+
+SECTION 3 — Per-Component Detail (repeated for each component)
+  3.1 Component Identity
+      component_id, serial_number, component_type, manufacturer
+  3.2 Burn-In Conditions
+      temperature, voltage, duration, chamber_id
+  3.3 Parameter Timeline Table
+      parameter | 0h | 24h | 96h | 168h | absolute_limit | status
+  3.4 Parameter Trend Chart
+      Line chart: value vs checkpoint, lot median overlay, limit line
+      [matplotlib PNG embedded in PDF]
+  3.5 Anomaly Events
+      IF anomaly detected: anomaly_type, anomaly_score, explanation narrative
+  3.6 Drift Prediction
+      Predicted 168h value, 95% CI, drift rate, safety margin
+      Drift trajectory chart with confidence band
+  3.7 Risk Assessment
+      risk_score, severity, reason_codes
+  3.8 Final Decision
+      decision label, decided_at, model_version
+  3.9 Engineer Review Record
+      reviewed_by, review_action, review_timestamp, review_notes
+
+SECTION 4 — Audit Trail Summary
+  Decision trace per component (condensed)
+  Link to full audit log
+
+SECTION 5 — Data Source Labels
+  SYNTHETIC / REAL label for all data used
+  Model version and training data version
+
+SECTION 6 — Mandatory Disclaimer
+  Full disclaimer text
+```
+
+---
+
+## LLD-19: FAIL-SAFE STATE MACHINE
+
+The system operates in one of four states:
+
+```
+States:
+  FULLY_OPERATIONAL    All services healthy, full AI screening active
+  DEGRADED_AI          AI services partially unavailable, hard safety rules active
+  SAFETY_ONLY          All AI services unavailable, hard safety rules only
+  MAINTENANCE          System in maintenance mode, no new screening
+
+Transitions:
+  FULLY_OPERATIONAL → DEGRADED_AI
+    Trigger: Any AI service health check fails
+    Action:  Alert ML_ENGINEER + ADMIN
+             Continue with available AI services
+             Flag decisions as PARTIAL_AI
+
+  FULLY_OPERATIONAL → SAFETY_ONLY
+    Trigger: All AI services fail simultaneously
+    Action:  Alert ALL roles
+             All decisions = MANUAL_REVIEW_REQUIRED
+             Hard safety rules still execute
+
+  DEGRADED_AI → FULLY_OPERATIONAL
+    Trigger: All AI services healthy for 3 consecutive health checks
+    Action:  Resume full AI screening, log recovery
+
+  DEGRADED_AI → SAFETY_ONLY
+    Trigger: Remaining AI services fail
+    Action:  Same as FULLY_OPERATIONAL → SAFETY_ONLY
+
+  SAFETY_ONLY → DEGRADED_AI
+    Trigger: At least one AI service recovers
+    Action:  Resume partial AI screening
+
+  ANY → MAINTENANCE
+    Trigger: Manual trigger by ADMIN
+    Action:  Reject new telemetry with 503
+             Complete in-flight processing
+
+MANDATORY INVARIANT:
+  In ANY state, hard safety rules execute for every measurement.
+  In ANY state, AI failure NEVER produces a silent PASS.
+  In SAFETY_ONLY state, every decision = MANUAL_REVIEW_REQUIRED.
+```
+
+---
+
+## LLD-20: LLD MERMAID DIAGRAMS
+
+### LLD Diagram 1: Data Quality Engine Flow
+
+```mermaid
+flowchart TD
+    REC[Incoming Telemetry Record] --> DQ01{DQ-01 Missing Required Field?}
+    DQ01 -->|YES| QUA[QUARANTINE + Alert]
+    DQ01 -->|NO| DQ02{DQ-02 Invalid Parameter Name?}
+    DQ02 -->|YES| QUA
+    DQ02 -->|NO| DQ03{DQ-03 Physical Bounds Violation?}
+    DQ03 -->|YES| QUA
+    DQ03 -->|NO| DQ04{DQ-04 Future Timestamp?}
+    DQ04 -->|YES| QUA
+    DQ04 -->|NO| DQ06{DQ-06 Duplicate Record?}
+    DQ06 -->|YES| DEDUP[DEDUPLICATE + LOG]
+    DQ06 -->|NO| DQ08{DQ-08 Stuck Sensor?}
+    DQ08 -->|YES| SUSP[FLAG SUSPECT + Alert]
+    DQ08 -->|NO| DQ10{DQ-10 Excessive Missing?}
+    DQ10 -->|YES| BLOCK[BLOCK ML INFERENCE + Flag]
+    DQ10 -->|NO| VALID[VALID - Compute Quality Score]
+    VALID --> STORE[Write to telemetry_clean]
+```
+
+### LLD Diagram 2: Feature Engineering Pipeline
+
+```mermaid
+graph TD
+    subgraph INPUT[Inputs]
+        TC[telemetry_clean records]
+        LS[Lot Statistics from Redis]
+    end
+    subgraph UNIVARIATE[Univariate Features]
+        F1[raw_value]
+        F2[moving_avg_3pt]
+        F3[rolling_std]
+        F4[slope_0h_to_now]
+        F5[rate_of_change]
+        F6[acceleration]
+        F11[temp_normalized_value]
+        F12[value_range_0h_to_now]
+        F13[trend_direction]
+    end
+    subgraph POPULATION[Population-Relative Features]
+        F7[deviation_from_lot_mean]
+        F8[deviation_from_lot_median]
+        F9[robust_z_score]
+        F10[percentile_in_lot]
+    end
+    subgraph OUTPUT[Feature Vector stored in features table]
+        FV[Complete Feature Vector per component per checkpoint]
+    end
+    TC --> F1 & F2 & F3 & F4 & F5 & F6 & F11 & F12 & F13
+    TC & LS --> F7 & F8 & F9 & F10
+    F1 & F2 & F3 & F4 & F5 & F6 & F7 & F8 & F9 & F10 & F11 & F12 & F13 --> FV
+```
+
+### LLD Diagram 3: Module A Internal Flow
+
+```mermaid
+flowchart TD
+    FV[Feature Vector] --> L1[Layer 1: Robust Z-score and MAD]
+    FV --> L2[Layer 2: Isolation Forest]
+    FV --> L3[Layer 3: Mahalanobis Distance]
+    FV --> L4[Layer 4: Temporal - Slope and Acceleration]
+    L1 --> |stat_score| AGG[Weighted Score Aggregation]
+    L2 --> |isolation_score| AGG
+    L3 --> |mahal_score| AGG
+    L4 --> |temporal_score| AGG
+    AGG --> AS[anomaly_score 0 to 1]
+    AS --> ATC[Anomaly Type Classification]
+    ATC --> |POPULATION_OUTLIER| OUT1[Output: anomaly_score, type, confidence]
+    ATC --> |TEMPORAL| OUT1
+    ATC --> |MULTIVARIATE| OUT1
+    ATC --> |COMPOSITE| OUT1
+    L2 -->|null if model unavailable| CONS[Conservative Default = 0.5]
+    CONS --> AGG
+```
+
+### LLD Diagram 4: Module B Internal Flow
+
+```mermaid
+flowchart TD
+    V0[value_0h] & V24[value_24h] --> VALID{Both values available?}
+    VALID -->|NO| UNAVAIL[Return PREDICTION_UNAVAILABLE]
+    VALID -->|YES| FEAT[Construct Input Feature Vector]
+    FEAT --> RIDGE[Ridge Regression - Baseline]
+    FEAT --> XGB[XGBoost - Primary]
+    FEAT --> XGB_Q025[XGBoost Quantile 0.025]
+    FEAT --> XGB_Q975[XGBoost Quantile 0.975]
+    RIDGE --> SANITY{Model Agreement Check}
+    XGB --> SANITY
+    SANITY -->|Disagree > threshold| PENALIZE[Reduce confidence by 0.3]
+    SANITY -->|Agree| METRICS[Compute Drift Metrics]
+    PENALIZE --> METRICS
+    XGB_Q025 & XGB_Q975 --> CI[95 percent Prediction Interval]
+    METRICS --> RISK[Drift Risk Classification]
+    CI --> CONF[Confidence Estimation from interval width]
+    RISK & CONF --> OUT[Output: predicted_168h, drift_rate, safety_margin, risk, CI]
+```
+
+### LLD Diagram 5: Risk Fusion Detail
+
+```mermaid
+flowchart TD
+    HSS{Hard Safety Status == FAIL?}
+    HSS -->|YES| OVERRIDE[risk_score = 1.0 - decision = FAIL - RETURN]
+    HSS -->|NO| NULL_CHECK[Handle null scores with conservative defaults]
+    NULL_CHECK --> NORM[Normalize population_deviation to 0-1]
+    NORM --> UNCERT[Compute uncertainty_penalty]
+    UNCERT --> DQP[Compute data_quality_penalty]
+    DQP --> FUSE[Weighted Fusion Formula]
+    FUSE --> CLIP[Clip to 0.0 - 1.0]
+    CLIP --> SEV[Map to Severity Level]
+    CLIP --> RC[Generate Reason Codes]
+    SEV & RC --> OUT[Output: risk_score, severity, reason_codes]
+```
+
+### LLD Diagram 6: Decision Engine State Flow
+
+```mermaid
+flowchart TD
+    IN[Input: risk_score, hard_safety_status, ai_available, dq_score] --> R1{Rule 1: Hard Limit Violated?}
+    R1 -->|YES| FAIL[FAIL - Deterministic - ai_overridable=False]
+    R1 -->|NO| R2{Rule 2: AI Services Available?}
+    R2 -->|NO| MRR[MANUAL_REVIEW_REQUIRED - Fail-Safe]
+    R2 -->|YES| R3{Rule 3: Data Quality >= 0.7?}
+    R3 -->|NO| MRR
+    R3 -->|YES| R4{Rule 4: risk_score >= 0.85?}
+    R4 -->|YES| HRR[HIGH_RISK_REVIEW - severity CRITICAL]
+    R4 -->|NO| R5{Rule 5: drift_risk >= 0.70?}
+    R5 -->|YES| EI[EARLY_INVESTIGATION - severity HIGH]
+    R5 -->|NO| R6{Rule 6: risk_score >= 0.40?}
+    R6 -->|YES| REV[REVIEW - severity MEDIUM]
+    R6 -->|NO| NORM[NORMAL - severity LOW]
+```
+
+### LLD Diagram 7: Fail-Safe State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> FULLY_OPERATIONAL
+    FULLY_OPERATIONAL --> DEGRADED_AI: Any AI service fails
+    FULLY_OPERATIONAL --> SAFETY_ONLY: All AI services fail
+    DEGRADED_AI --> FULLY_OPERATIONAL: All services healthy x3 checks
+    DEGRADED_AI --> SAFETY_ONLY: Remaining AI services fail
+    SAFETY_ONLY --> DEGRADED_AI: At least one AI service recovers
+    FULLY_OPERATIONAL --> MAINTENANCE: Admin trigger
+    DEGRADED_AI --> MAINTENANCE: Admin trigger
+    SAFETY_ONLY --> MAINTENANCE: Admin trigger
+    MAINTENANCE --> FULLY_OPERATIONAL: Admin release
+
+    note right of SAFETY_ONLY
+        All decisions = MANUAL_REVIEW_REQUIRED
+        Hard safety rules still execute
+        AI failure never = silent PASS
+    end note
+```
+
+### LLD Diagram 8: Audit Trail Trace
+
+```mermaid
+flowchart TD
+    TEL[Telemetry Record - raw_id] --> DQ[Data Quality Result - quality_score]
+    DQ --> HSR[Safety Rule Result - hard_safety_status]
+    HSR --> MODA[Anomaly Detection - anomaly_score + model_version]
+    MODA --> MODB[Drift Prediction - predicted_168h + confidence]
+    MODB --> COR[Correlation Result - correlation_score]
+    COR --> RF[Risk Fusion - risk_score + weights + reason_codes]
+    RF --> EXP[Explanation - narrative + SHAP values]
+    EXP --> DEC[Final Decision - label + severity + timestamp]
+    DEC --> ENG[Engineer Review - action + notes + timestamp]
+    ENG --> AUD[Audit Log Entry - IMMUTABLE - append-only]
+    AUD --> REPR[Reproducibility: same input + model_version = same decision]
+```
+
+### LLD Diagram 9: Ingestion Service Internal Flow
+
+```mermaid
+flowchart TD
+    subgraph ENTRY[Entry Points]
+        REST[POST /api/v1/telemetry]
+        BATCH[POST /api/v1/telemetry/batch]
+        MQTT_IN[MQTT Subscriber]
+    end
+    subgraph SINGLE[Single Record Flow]
+        PARSE[Parse JSON]
+        PYDANTIC[Pydantic Validation]
+        ENRICH[Enrich: add ingestion_timestamp]
+        WRITE_RAW[Write to telemetry_raw]
+        QUEUE[Push to queue:validation]
+    end
+    subgraph BATCH_FLOW[Batch Flow]
+        DETECT[Detect Format CSV/JSON/Parquet]
+        PARSE_DF[Parse to DataFrame]
+        ROW_VAL[Row-level Pydantic Validation]
+        SPLIT[Split VALID and INVALID]
+        BULK[Bulk Insert VALID to telemetry_raw]
+        QUAR[Write INVALID to quarantine]
+    end
+    REST --> PARSE --> PYDANTIC --> ENRICH --> WRITE_RAW --> QUEUE
+    MQTT_IN --> PARSE
+    BATCH --> DETECT --> PARSE_DF --> ROW_VAL --> SPLIT
+    SPLIT --> BULK & QUAR
+```
+
+### LLD Diagram 10: MLflow Model Lifecycle
+
+```mermaid
+flowchart TD
+    TRAIN[Training Script - MLflow autolog] --> RUN[MLflow Run - params + metrics + artifacts]
+    RUN --> EVAL{Metrics pass thresholds?}
+    EVAL -->|NO| TRAIN
+    EVAL -->|YES| REG[Register in MLflow Model Registry - STAGING]
+    REG --> REVIEW[ML Engineer + QA Engineer Review]
+    REVIEW -->|Approved| PROD[Promote to PRODUCTION]
+    REVIEW -->|Rejected| ARCH1[Archive Run]
+    PROD --> SERVE[Inference Services load PRODUCTION model]
+    SERVE --> MON[Monitor: PSI, error rate, score distribution]
+    MON -->|Drift detected PSI > 0.2| ALERT[Alert ML Engineer]
+    ALERT --> RETRAIN{Manual approval to retrain?}
+    RETRAIN -->|YES| TRAIN
+    RETRAIN -->|NO| FLAG[Flag predictions as POTENTIALLY_DEGRADED]
+    PROD --> |Superseded| ARCH2[Archive to ARCHIVED - retained for rollback]
+```
+
+---
+
+*LLD Document Version: 1.0.0*
+*Project: SIH26170*
+*Prepared for: Smart India Hackathon Technical Presentation*
+*All thresholds marked [ASSUMPTION] require calibration on real validated data before operational use.*
